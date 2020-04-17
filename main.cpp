@@ -1,6 +1,7 @@
 #include <nitro.hpp>
 #include <wayland-server.h>
 #include <xdg-shell.h>
+#include <utility>
 
 class Display {
 	wl_display* display;
@@ -23,12 +24,23 @@ public:
 	}
 	template <class G> void create_global(G& global) {
 		wl_global_bind_func_t bind = [](wl_client* client, void* data, uint32_t version, uint32_t id) {
-			static_cast<G*>(data)->bind(client, version, id);
+			wl_resource* resource = wl_resource_create(client, G::get_interface(), version, id);
+			wl_resource_set_implementation(resource, G::get_implementation(), data, nullptr);
 		};
 		wl_global_create(display, G::get_interface(), G::get_version(), &global, bind);
 	}
 	void init_shm() {
 		wl_display_init_shm(display);
+	}
+	template <class R, class... A> static R* create_resource(wl_client* client, uint32_t id, A&&... arguments) {
+		wl_resource* resource = wl_resource_create(client, R::get_interface(), R::get_version(), id);
+		R* r = new R(resource, std::forward<A>(arguments)...);
+		wl_resource_destroy_func_t destroy = [](wl_resource* resource) {
+			R* r = static_cast<R*>(wl_resource_get_user_data(resource));
+			delete r;
+		};
+		wl_resource_set_implementation(resource, R::get_implementation(), r, destroy);
+		return r;
 	}
 };
 
@@ -45,7 +57,7 @@ class Surface {
 	wl_resource* resource;
 	wl_resource* buffer;
 public:
-	Surface(wl_resource* resource = nullptr): resource(resource), buffer(nullptr) {}
+	Surface(wl_resource* resource): resource(resource), buffer(nullptr) {}
 	void destroy(wl_client* client, wl_resource* resource) {
 		// TODO: implement
 	}
@@ -66,9 +78,9 @@ public:
 	}
 	void commit(wl_client* client, wl_resource* resource) {
 		if (wl_shm_buffer* b = wl_shm_buffer_get(buffer)) {
-			const int32_t width = wl_shm_buffer_get_width(b);
-			const int32_t height = wl_shm_buffer_get_height(b);
-			void* data = wl_shm_buffer_get_data(b);
+			//const int32_t width = wl_shm_buffer_get_width(b);
+			//const int32_t height = wl_shm_buffer_get_height(b);
+			//void* data = wl_shm_buffer_get_data(b);
 		}
 	}
 	void set_buffer_transform(wl_client* client, wl_resource* resource, int32_t transform) {
@@ -101,16 +113,12 @@ public:
 		};
 		return &implementation;
 	}
-	void bind(wl_client* client, uint32_t version, uint32_t id) {
-		resource = wl_resource_create(client, get_interface(), version, id);
-		wl_resource_set_implementation(resource, get_implementation(), this, nullptr);
-	}
 };
 
 class Region {
 	wl_resource* resource;
 public:
-	Region(wl_resource* resource = nullptr): resource(resource) {}
+	Region(wl_resource* resource): resource(resource) {}
 	void destroy(wl_client* client, wl_resource* resource) {
 		// TODO: implement
 	}
@@ -134,22 +142,16 @@ public:
 		};
 		return &implementation;
 	}
-	void bind(wl_client* client, uint32_t version, uint32_t id) {
-		resource = wl_resource_create(client, get_interface(), version, id);
-		wl_resource_set_implementation(resource, get_implementation(), this, nullptr);
-	}
 };
 
 class Compositor {
 public:
 	virtual ~Compositor() = default;
 	virtual void create_surface(wl_client* client, wl_resource* resource, uint32_t id) {
-		Surface* surface = new Surface();
-		surface->bind(client, Surface::get_version(), id);
+		Display::create_resource<Surface>(client, id);
 	}
 	virtual void create_region(wl_client* client, wl_resource* resource, uint32_t id) {
-		Region* region = new Region();
-		region->bind(client, Region::get_version(), id);
+		Display::create_resource<Region>(client, id);
 	}
 	static constexpr const wl_interface* get_interface() {
 		return &wl_compositor_interface;
@@ -163,10 +165,6 @@ public:
 			Method<&Compositor::create_region>::callback,
 		};
 		return &implementation;
-	}
-	void bind(wl_client* client, uint32_t version, uint32_t id) {
-		wl_resource* resource = wl_resource_create(client, get_interface(), version, id);
-		wl_resource_set_implementation(resource, get_implementation(), this, nullptr);
 	}
 };
 
@@ -215,7 +213,13 @@ class XdgToplevel {
 		// TODO: implement
 	}
 public:
-	XdgToplevel(wl_resource* resource = nullptr): resource(resource) {}
+	XdgToplevel(wl_resource* resource): resource(resource) {}
+	void send_configure(int32_t width, int32_t height, wl_array *states) {
+		xdg_toplevel_send_configure(resource, width, height, states);
+	}
+	void send_close() {
+		xdg_toplevel_send_close(resource);
+	}
 	static constexpr const wl_interface* get_interface() {
 		return &xdg_toplevel_interface;
 	}
@@ -241,10 +245,6 @@ public:
 		};
 		return &implementation;
 	}
-	void bind(wl_client* client, uint32_t version, uint32_t id) {
-		resource = wl_resource_create(client, get_interface(), version, id);
-		wl_resource_set_implementation(resource, get_implementation(), this, nullptr);
-	}
 };
 
 class XdgSurface {
@@ -253,8 +253,7 @@ class XdgSurface {
 		// TODO: implement
 	}
 	void get_toplevel(wl_client* client, wl_resource* resource, uint32_t id) {
-		XdgToplevel* toplevel = new XdgToplevel();
-		toplevel->bind(client, XdgToplevel::get_version(), id);
+		Display::create_resource<XdgToplevel>(client, id);
 	}
 	void get_popup(wl_client* client, wl_resource* resource, uint32_t id, wl_resource* parent, wl_resource* positioner) {
 		// TODO: implement
@@ -266,7 +265,10 @@ class XdgSurface {
 		// TODO: implement
 	}
 public:
-	XdgSurface(wl_resource* resource = nullptr): resource(resource) {}
+	XdgSurface(wl_resource* resource): resource(resource) {}
+	void send_configure(uint32_t serial) {
+		xdg_surface_send_configure(resource, serial);
+	}
 	static constexpr const wl_interface* get_interface() {
 		return &xdg_surface_interface;
 	}
@@ -283,10 +285,6 @@ public:
 		};
 		return &implementation;
 	}
-	void bind(wl_client* client, uint32_t version, uint32_t id) {
-		resource = wl_resource_create(client, get_interface(), version, id);
-		wl_resource_set_implementation(resource, get_implementation(), this, nullptr);
-	}
 };
 
 class XdgWmBase {
@@ -298,8 +296,7 @@ public:
 		// TODO: implement
 	}
 	void get_xdg_surface(wl_client* client, wl_resource* resource, uint32_t id, wl_resource* surface) {
-		XdgSurface* xdg_surface = new XdgSurface();
-		xdg_surface->bind(client, XdgSurface::get_version(), id);
+		Display::create_resource<XdgSurface>(client, id);
 	}
 	void pong(wl_client* client, wl_resource* resource, uint32_t serial) {
 		// TODO: implement
@@ -318,10 +315,6 @@ public:
 			Method<&XdgWmBase::pong>::callback,
 		};
 		return &implementation;
-	}
-	void bind(wl_client* client, uint32_t version, uint32_t id) {
-		wl_resource* resource = wl_resource_create(client, get_interface(), version, id);
-		wl_resource_set_implementation(resource, get_implementation(), this, nullptr);
 	}
 };
 
