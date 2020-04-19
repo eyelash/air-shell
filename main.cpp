@@ -2,6 +2,33 @@
 #include <wayland-server.h>
 #include <xdg-shell.h>
 #include <utility>
+#include <new>
+
+class Shell: public nitro::Node {
+	nitro::Node* surface = nullptr;
+public:
+	nitro::Node* get_child(size_t index) override {
+		return index == 0 ? surface : nullptr;
+	}
+	void layout() override {
+		if (surface) {
+			surface->set_size(get_width(), get_height());
+		}
+	}
+	void set_surface(nitro::Node* surface) {
+		/*if (surface == this->surface) {
+			return;
+		}*/
+		this->surface = surface;
+		if (surface) {
+			surface->set_parent(this);
+		}
+		layout();
+		request_redraw();
+	}
+};
+
+Shell* shell = nullptr;
 
 class Display {
 	wl_display* display;
@@ -32,15 +59,24 @@ public:
 	void init_shm() {
 		wl_display_init_shm(display);
 	}
-	template <class R, class... A> static R* create_resource(wl_client* client, uint32_t id, A&&... arguments) {
-		wl_resource* resource = wl_resource_create(client, R::interface, R::version, id);
-		R* r = new R(resource, std::forward<A>(arguments)...);
-		wl_resource_destroy_func_t destroy = [](wl_resource* resource) {
-			R* r = static_cast<R*>(wl_resource_get_user_data(resource));
-			delete r;
-		};
-		wl_resource_set_implementation(resource, &R::implementation, r, destroy);
-		return r;
+};
+
+class Array {
+	wl_array array;
+public:
+	Array() {
+		wl_array_init(&array);
+	}
+	Array(const Array&) = delete;
+	~Array() {
+		wl_array_release(&array);
+	}
+	Array& operator =(const Array&) = delete;
+	operator wl_array*() {
+		return &array;
+	}
+	template <class T> void add(const T& t) {
+		new (wl_array_add(&array, sizeof(T))) T(t);
 	}
 };
 
@@ -53,11 +89,24 @@ public:
 	}
 };
 
-class Surface {
-	wl_resource* resource;
+class Surface: public nitro::Node {
+	nitro::Canvas canvas;
+	wl_resource* wl_surface_resource;
+	wl_resource* xdg_toplevel_resource;
+	wl_resource* xdg_surface_resource;
 	wl_resource* buffer;
+	wl_resource* frame_callback;
 public:
-	Surface(wl_resource* resource): resource(resource), buffer(nullptr) {}
+	Surface(wl_resource* resource): wl_surface_resource(resource), xdg_toplevel_resource(nullptr), xdg_surface_resource(nullptr), buffer(nullptr), frame_callback(nullptr) {}
+	void draw(const nitro::DrawContext& draw_context) override {
+		canvas.draw(draw_context.projection);
+		if (frame_callback) {
+			wl_callback_send_done(frame_callback, nitro::Animation::get_time() / 1000);
+			wl_resource_destroy(frame_callback);
+			frame_callback = nullptr;
+		}
+	}
+	// wl_surface
 	void destroy(wl_client* client, wl_resource* resource) {
 		// TODO: implement
 	}
@@ -68,7 +117,7 @@ public:
 		// TODO: implement
 	}
 	void frame(wl_client* client, wl_resource* resource, uint32_t callback) {
-		// TODO: implement
+		frame_callback = wl_resource_create(client, &wl_callback_interface, 1, callback);
 	}
 	void set_opaque_region(wl_client* client, wl_resource* resource, wl_resource* region) {
 		// TODO: implement
@@ -77,10 +126,21 @@ public:
 		// TODO: implement
 	}
 	void commit(wl_client* client, wl_resource* resource) {
-		if (wl_shm_buffer* b = wl_shm_buffer_get(buffer)) {
-			//const int32_t width = wl_shm_buffer_get_width(b);
-			//const int32_t height = wl_shm_buffer_get_height(b);
-			//void* data = wl_shm_buffer_get_data(b);
+		if (buffer == nullptr) {
+			Array states;
+			send_configure(0, 0, states);
+			return;
+		}
+		if (wl_shm_buffer* shm_buffer = wl_shm_buffer_get(buffer)) {
+			const int32_t width = wl_shm_buffer_get_width(shm_buffer);
+			const int32_t height = wl_shm_buffer_get_height(shm_buffer);
+			unsigned char* data = static_cast<unsigned char*>(wl_shm_buffer_get_data(shm_buffer));
+			canvas.clear();
+			canvas.set_texture(0, 0, width, height, nitro::Texture::create_from_data(width, height, 4, data));
+			canvas.prepare();
+			shell->set_surface(this);
+			wl_buffer_send_release(buffer);
+			request_redraw();
 		}
 	}
 	void set_buffer_transform(wl_client* client, wl_resource* resource, int32_t transform) {
@@ -92,9 +152,8 @@ public:
 	void damage_buffer(wl_client* client, wl_resource* resource, int32_t x, int32_t y, int32_t width, int32_t height) {
 		// TODO: implement
 	}
-	static constexpr const wl_interface* interface = &wl_surface_interface;
-	static constexpr int version = 4;
-	static constexpr struct wl_surface_interface implementation = {
+	static constexpr int wl_surface_version = 4;
+	static constexpr struct wl_surface_interface wl_surface_implementation = {
 		Method<&Surface::destroy>::callback,
 		Method<&Surface::attach>::callback,
 		Method<&Surface::damage>::callback,
@@ -106,52 +165,7 @@ public:
 		Method<&Surface::set_buffer_scale>::callback,
 		Method<&Surface::damage_buffer>::callback,
 	};
-};
-
-class Region {
-	wl_resource* resource;
-public:
-	Region(wl_resource* resource): resource(resource) {}
-	void destroy(wl_client* client, wl_resource* resource) {
-		// TODO: implement
-	}
-	void add(wl_client* client, wl_resource* resource, int32_t x, int32_t y, int32_t width, int32_t height) {
-		// TODO: implement
-	}
-	void subtract(wl_client* client, wl_resource* resource, int32_t x, int32_t y, int32_t width, int32_t height) {
-		// TODO: implement
-	}
-	static constexpr const wl_interface* interface = &wl_region_interface;
-	static constexpr int version = 1;
-	static constexpr struct wl_region_interface implementation = {
-		Method<&Region::destroy>::callback,
-		Method<&Region::add>::callback,
-		Method<&Region::subtract>::callback,
-	};
-};
-
-class Compositor {
-public:
-	virtual ~Compositor() = default;
-	virtual void create_surface(wl_client* client, wl_resource* resource, uint32_t id) {
-		Display::create_resource<Surface>(client, id);
-	}
-	virtual void create_region(wl_client* client, wl_resource* resource, uint32_t id) {
-		Display::create_resource<Region>(client, id);
-	}
-	static constexpr const wl_interface* interface = &wl_compositor_interface;
-	static constexpr int version = 1;
-	static constexpr struct wl_compositor_interface implementation = {
-		Method<&Compositor::create_surface>::callback,
-		Method<&Compositor::create_region>::callback,
-	};
-};
-
-class XdgToplevel {
-	wl_resource* resource;
-	void destroy(wl_client* client, wl_resource* resource) {
-		// TODO: implement
-	}
+	// xdg_toplevel
 	void set_parent(wl_client* client, wl_resource* resource, wl_resource* parent) {
 		// TODO: implement
 	}
@@ -191,41 +205,27 @@ class XdgToplevel {
 	void set_minimized(wl_client* client, wl_resource* resource) {
 		// TODO: implement
 	}
-public:
-	XdgToplevel(wl_resource* resource): resource(resource) {}
-	void send_configure(int32_t width, int32_t height, wl_array *states) {
-		xdg_toplevel_send_configure(resource, width, height, states);
-	}
-	void send_close() {
-		xdg_toplevel_send_close(resource);
-	}
-	static constexpr const wl_interface* interface = &xdg_toplevel_interface;
-	static constexpr int version = 1;
-	static constexpr struct xdg_toplevel_interface implementation = {
-		Method<&XdgToplevel::destroy>::callback,
-		Method<&XdgToplevel::set_parent>::callback,
-		Method<&XdgToplevel::set_title>::callback,
-		Method<&XdgToplevel::set_app_id>::callback,
-		Method<&XdgToplevel::show_window_menu>::callback,
-		Method<&XdgToplevel::move>::callback,
-		Method<&XdgToplevel::resize>::callback,
-		Method<&XdgToplevel::set_max_size>::callback,
-		Method<&XdgToplevel::set_min_size>::callback,
-		Method<&XdgToplevel::set_maximized>::callback,
-		Method<&XdgToplevel::unset_maximized>::callback,
-		Method<&XdgToplevel::set_fullscreen>::callback,
-		Method<&XdgToplevel::unset_fullscreen>::callback,
-		Method<&XdgToplevel::set_minimized>::callback,
+	static constexpr int xdg_toplevel_version = 1;
+	static constexpr struct xdg_toplevel_interface xdg_toplevel_implementation = {
+		Method<&Surface::destroy>::callback,
+		Method<&Surface::set_parent>::callback,
+		Method<&Surface::set_title>::callback,
+		Method<&Surface::set_app_id>::callback,
+		Method<&Surface::show_window_menu>::callback,
+		Method<&Surface::move>::callback,
+		Method<&Surface::resize>::callback,
+		Method<&Surface::set_max_size>::callback,
+		Method<&Surface::set_min_size>::callback,
+		Method<&Surface::set_maximized>::callback,
+		Method<&Surface::unset_maximized>::callback,
+		Method<&Surface::set_fullscreen>::callback,
+		Method<&Surface::unset_fullscreen>::callback,
+		Method<&Surface::set_minimized>::callback,
 	};
-};
-
-class XdgSurface {
-	wl_resource* resource;
-	void destroy(wl_client* client, wl_resource* resource) {
-		// TODO: implement
-	}
+	// xdg_surface
 	void get_toplevel(wl_client* client, wl_resource* resource, uint32_t id) {
-		Display::create_resource<XdgToplevel>(client, id);
+		xdg_toplevel_resource = wl_resource_create(client, &xdg_toplevel_interface, xdg_toplevel_version, id);
+		wl_resource_set_implementation(xdg_toplevel_resource, &xdg_toplevel_implementation, this, nullptr);
 	}
 	void get_popup(wl_client* client, wl_resource* resource, uint32_t id, wl_resource* parent, wl_resource* positioner) {
 		// TODO: implement
@@ -236,19 +236,77 @@ class XdgSurface {
 	void ack_configure(wl_client* client, wl_resource* resource, uint32_t serial) {
 		// TODO: implement
 	}
-public:
-	XdgSurface(wl_resource* resource): resource(resource) {}
-	void send_configure(uint32_t serial) {
-		xdg_surface_send_configure(resource, serial);
+	static constexpr int xdg_surface_version = 1;
+	static constexpr struct xdg_surface_interface xdg_surface_implementation = {
+		Method<&Surface::destroy>::callback,
+		Method<&Surface::get_toplevel>::callback,
+		Method<&Surface::get_popup>::callback,
+		Method<&Surface::set_window_geometry>::callback,
+		Method<&Surface::ack_configure>::callback,
+	};
+	void send_configure(int32_t width, int32_t height, wl_array *states) {
+		xdg_toplevel_send_configure(xdg_toplevel_resource, width, height, states);
+		xdg_surface_send_configure(xdg_surface_resource, 0);
 	}
-	static constexpr const wl_interface* interface = &xdg_surface_interface;
+	void create_xdg_surface(wl_client* client, uint32_t id) {
+		xdg_surface_resource = wl_resource_create(client, &xdg_surface_interface, xdg_surface_version, id);
+		wl_resource_set_implementation(xdg_surface_resource, &xdg_surface_implementation, this, nullptr);
+	}
+	static void create(wl_client* client, uint32_t id) {
+		wl_resource* resource = wl_resource_create(client, &wl_surface_interface, wl_surface_version, id);
+		Surface* surface = new Surface(resource);
+		wl_resource_destroy_func_t destroy = [](wl_resource* resource) {
+			// TODO: implement
+		};
+		wl_resource_set_implementation(resource, &wl_surface_implementation, surface, destroy);
+	}
+};
+
+class Region {
+	wl_resource* resource;
+public:
+	Region(wl_resource* resource): resource(resource) {}
+	void destroy(wl_client* client, wl_resource* resource) {
+		// TODO: implement
+	}
+	void add(wl_client* client, wl_resource* resource, int32_t x, int32_t y, int32_t width, int32_t height) {
+		// TODO: implement
+	}
+	void subtract(wl_client* client, wl_resource* resource, int32_t x, int32_t y, int32_t width, int32_t height) {
+		// TODO: implement
+	}
+	static constexpr const wl_interface* interface = &wl_region_interface;
 	static constexpr int version = 1;
-	static constexpr struct xdg_surface_interface implementation = {
-		Method<&XdgSurface::destroy>::callback,
-		Method<&XdgSurface::get_toplevel>::callback,
-		Method<&XdgSurface::get_popup>::callback,
-		Method<&XdgSurface::set_window_geometry>::callback,
-		Method<&XdgSurface::ack_configure>::callback,
+	static constexpr struct wl_region_interface implementation = {
+		Method<&Region::destroy>::callback,
+		Method<&Region::add>::callback,
+		Method<&Region::subtract>::callback,
+	};
+	static void create(wl_client* client, uint32_t id) {
+		wl_resource* resource = wl_resource_create(client, &wl_region_interface, version, id);
+		Region* region = new Region(resource);
+		wl_resource_destroy_func_t destroy = [](wl_resource* resource) {
+			Region* region = static_cast<Region*>(wl_resource_get_user_data(resource));
+			delete region;
+		};
+		wl_resource_set_implementation(resource, &implementation, region, destroy);
+	}
+};
+
+class Compositor {
+public:
+	virtual ~Compositor() = default;
+	virtual void create_surface(wl_client* client, wl_resource* resource, uint32_t id) {
+		Surface::create(client, id);
+	}
+	virtual void create_region(wl_client* client, wl_resource* resource, uint32_t id) {
+		Region::create(client, id);
+	}
+	static constexpr const wl_interface* interface = &wl_compositor_interface;
+	static constexpr int version = 1;
+	static constexpr struct wl_compositor_interface implementation = {
+		Method<&Compositor::create_surface>::callback,
+		Method<&Compositor::create_region>::callback,
 	};
 };
 
@@ -261,7 +319,7 @@ public:
 		// TODO: implement
 	}
 	void get_xdg_surface(wl_client* client, wl_resource* resource, uint32_t id, wl_resource* surface) {
-		Display::create_resource<XdgSurface>(client, id);
+		static_cast<Surface*>(wl_resource_get_user_data(surface))->create_xdg_surface(client, id);
 	}
 	void pong(wl_client* client, wl_resource* resource, uint32_t serial) {
 		// TODO: implement
@@ -277,6 +335,7 @@ public:
 };
 
 int main() {
+	shell = new Shell();
 	Display display;
 	Compositor compositor;
 	XdgWmBase wm_base;
@@ -284,5 +343,6 @@ int main() {
 	display.create_global(wm_base);
 	display.init_shm();
 	nitro::WindowX11 window(800, 600, "air-shell");
+	window.set_child(shell);
 	window.run(display);
 }
